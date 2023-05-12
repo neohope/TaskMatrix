@@ -40,6 +40,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import wget
 
+# 这里的promot就是告知chatgpt，如何选择工具
 VISUAL_CHATGPT_PREFIX = """Visual ChatGPT is designed to be able to assist with a wide range of text and visual related tasks, from answering simple questions to providing in-depth explanations and discussions on a wide range of topics. Visual ChatGPT is able to generate human-like text based on the input it receives, allowing it to engage in natural-sounding conversations and provide responses that are coherent and relevant to the topic at hand.
 
 Visual ChatGPT is able to process and understand large amounts of text and images. As a language model, Visual ChatGPT can not directly read images, but it has a list of tools to finish different visual tasks. Each image will have a file name formed as "image/xxx.png", and Visual ChatGPT can invoke different tools to indirectly understand pictures. When talking about images, Visual ChatGPT is very strict to the file name and will never fabricate nonexistent files. When using tools to generate new image files, Visual ChatGPT is also known that the image may not be the same as the user's demand, and will use other visual question answering tools or description tools to observe the real image. Visual ChatGPT is able to use tools in a sequence, and is loyal to the tool observation outputs rather than faking the image content and image file name. It will remember to provide the file name from the last tool observation, if a new image is generated.
@@ -238,6 +239,9 @@ def get_new_image_name(org_img_name, func_name="update"):
     new_file_name = f'{this_new_uuid}_{func_name}_{recent_prev_file_name}_{most_org_file_name}.png'
     return os.path.join(head, new_file_name)
 
+# 下面定义了很多工具类
+# 每个工具类初始化好了prompt，用于ChatGPT选用工具
+# 设置好了pipeline，用于实际调用模型
 class InstructPix2Pix:
     def __init__(self, device):
         print(f"Initializing InstructPix2Pix to {device}")
@@ -1249,6 +1253,8 @@ class ImageEditing:
         return updated_image_path
 
 
+# 聊天机器人
+# 本框架其实就是通过ConversationBot，调用ChatGPT去判断调用哪个工具
 class ConversationBot:
     def __init__(self, load_dict):
         # load_dict = {'VisualQuestionAnswering':'cuda:0', 'ImageCaptioning':'cuda:1',...}
@@ -1256,12 +1262,15 @@ class ConversationBot:
         if 'ImageCaptioning' not in load_dict:
             raise ValueError("You have to load ImageCaptioning as a basic function for VisualChatGPT")
 
+        # 在这里加载各类工具
         self.models = {}
-        # Load Basic Foundation Models
+    
+        # 加载基础功能类模型
         for class_name, device in load_dict.items():
             self.models[class_name] = globals()[class_name](device=device)
 
-        # Load Template Foundation Models
+        # 加载模板类模型，其实就是组合类模型
+        # InfinityOutPainting、ObjectSegmenting、ImageEditing
         for class_name, module in globals().items():
             if getattr(module, 'template_model', False):
                 template_required_names = {k for k in inspect.signature(module.__init__).parameters.keys() if k!='self'}
@@ -1272,6 +1281,7 @@ class ConversationBot:
         
         print(f"All the Available Functions: {self.models}")
 
+        # 遍历inference开头的函数，构建字典，从而可以让chapgpt通过函数描述+用户需要的功能，选用对应的工具
         self.tools = []
         for instance in self.models.values():
             for e in dir(instance):
@@ -1291,6 +1301,8 @@ class ConversationBot:
             PREFIX, FORMAT_INSTRUCTIONS, SUFFIX = VISUAL_CHATGPT_PREFIX_CN, VISUAL_CHATGPT_FORMAT_INSTRUCTIONS_CN, VISUAL_CHATGPT_SUFFIX_CN
             place = "输入文字并回车，或者上传图片"
             label_clear = "清除"
+        
+        # 通过conversational-react-description判断采用哪个工具
         self.agent = initialize_agent(
             self.tools,
             self.llm,
@@ -1302,6 +1314,7 @@ class ConversationBot:
                           'suffix': SUFFIX}, )
         return gr.update(visible = True), gr.update(visible = False), gr.update(placeholder=place), gr.update(value=label_clear)
 
+    # 处理文本输入
     def run_text(self, text, state):
         self.agent.memory.buffer = cut_dialogue_history(self.agent.memory.buffer, keep_last_n_words=500)
         res = self.agent({"input": text.strip()})
@@ -1312,6 +1325,7 @@ class ConversationBot:
               f"Current Memory: {self.agent.memory.buffer}")
         return state, state
 
+    # 处理图像输入
     def run_image(self, image, state, txt, lang):
         image_filename = os.path.join('image', f"{str(uuid.uuid4())[:8]}.png")
         print("======>Auto Resize Image...")
@@ -1339,14 +1353,27 @@ class ConversationBot:
         return state, state, f'{txt} {image_filename} '
 
 
+# 制定了加载哪个模型，每个模型用哪个GPU或用CPU
+# python visual_chatgpt.py --load "Text2Box_cuda:0,Segmenting_cuda:0,
+#     Inpainting_cuda:0,ImageCaptioning_cuda:0,
+#     Text2Image_cuda:1,Image2Canny_cpu,CannyText2Image_cuda:1,
+#     Image2Depth_cpu,DepthText2Image_cuda:1,VisualQuestionAnswering_cuda:2,
+#     InstructPix2Pix_cuda:2,Image2Scribble_cpu,ScribbleText2Image_cuda:2,
+#     SegText2Image_cuda:2,Image2Pose_cpu,PoseText2Image_cuda:2,
+#     Image2Hed_cpu,HedText2Image_cuda:3,Image2Normal_cpu,
+#     NormalText2Image_cuda:3,Image2Line_cpu,LineText2Image_cuda:3"
 if __name__ == '__main__':
     if not os.path.exists("checkpoints"):
         os.mkdir("checkpoints")
+
+    # 解析参数，加载模型，通过ConversationBot去串连后续的各类工具
     parser = argparse.ArgumentParser()
     parser.add_argument('--load', type=str, default="ImageCaptioning_cuda:0,Text2Image_cuda:0")
     args = parser.parse_args()
     load_dict = {e.split('_')[0].strip(): e.split('_')[1].strip() for e in args.load.split(',')}
     bot = ConversationBot(load_dict=load_dict)
+
+    # 交互界面
     with gr.Blocks(css="#chatbot .overflow-y-auto{height:500px}") as demo:
         lang = gr.Radio(choices = ['Chinese','English'], value=None, label='Language')
         chatbot = gr.Chatbot(elem_id="chatbot", label="Visual ChatGPT")
